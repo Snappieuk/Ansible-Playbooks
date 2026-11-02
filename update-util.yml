@@ -1,0 +1,137 @@
+---
+# Rolling update of every node in a Proxmox VE cluster, one node at a time.
+#
+# Per node:
+#   1. Confirm the cluster is quorate
+#   2. apt update + dist-upgrade (optionally install extra packages)
+#   3. Work out whether a reboot is needed (new kernel or reboot-required flag)
+#   4. If so: put node in HA maintenance mode, wait for guests to leave,
+#      reboot, wait for quorum, take node out of maintenance
+#   5. Verify core PVE services are healthy before moving to the next node
+#
+# any_errors_fatal stops the whole run at the first problem, so a bad update
+# never gets rolled out to the remaining nodes.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini proxmox-update.yml --limit prox08   # test one node first
+#   ansible-playbook -i inventory.ini proxmox-update.yml                  # whole cluster
+#   ansible-playbook -i inventory.ini proxmox-update.yml -e allow_reboot=false
+#   ansible-playbook -i inventory.ini proxmox-update.yml -e '{"extra_packages":["libpve-network-perl","dnsmasq"]}'
+
+- name: Rolling update of Proxmox VE cluster nodes
+  hosts: proxmox
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: true
+
+  vars:
+    allow_reboot: true            # reboot nodes when a new kernel / reboot flag is present
+    use_ha_maintenance: true      # use `ha-manager crm-command node-maintenance` around reboots
+    wait_for_guests_to_leave: true  # refuse to reboot while VMs/CTs are still running on the node
+    extra_packages: []            # extra packages to install/upgrade on every node
+    pve_node_name: "{{ ansible_facts['hostname'] }}"  # name Proxmox knows this node by
+    guest_drain_retries: 60       # x delay below = max wait for guests to move off
+    guest_drain_delay: 10
+    quorum_retries: 60
+    quorum_delay: 10
+
+  tasks:
+    - name: Check the cluster is quorate before touching this node
+      ansible.builtin.shell: pvecm status | grep -Eq 'Quorate:\s+Yes'
+      changed_when: false
+
+    - name: Update package index and dist-upgrade
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        dpkg_options: force-confold,force-confdef
+      register: apt_result
+
+    - name: Install / upgrade extra packages
+      ansible.builtin.apt:
+        name: "{{ extra_packages }}"
+        state: latest
+      when: extra_packages | length > 0
+
+    - name: Get running kernel
+      ansible.builtin.command: uname -r
+      register: running_kernel
+      changed_when: false
+
+    - name: Get newest installed kernel
+      ansible.builtin.shell: ls -1 /boot/vmlinuz-* | sed 's|/boot/vmlinuz-||' | sort -V | tail -n1
+      register: newest_kernel
+      changed_when: false
+
+    - name: Check for reboot-required flag
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+
+    - name: Decide whether this node needs a reboot
+      ansible.builtin.set_fact:
+        needs_reboot: >-
+          {{ reboot_flag.stat.exists or
+             (running_kernel.stdout | trim) != (newest_kernel.stdout | trim) }}
+
+    - name: Report reboot decision
+      ansible.builtin.debug:
+        msg: >-
+          {{ pve_node_name }}: running kernel {{ running_kernel.stdout }},
+          newest installed {{ newest_kernel.stdout }},
+          reboot needed: {{ needs_reboot }},
+          reboot allowed: {{ allow_reboot }}
+
+    - name: Reboot sequence
+      when: needs_reboot | bool and allow_reboot | bool
+      block:
+        - name: Put node into HA maintenance mode
+          ansible.builtin.command: >-
+            ha-manager crm-command node-maintenance enable {{ pve_node_name }}
+          when: use_ha_maintenance | bool
+
+        - name: Wait for running VMs and containers to leave this node
+          ansible.builtin.shell: |
+            (qm list 2>/dev/null | awk 'NR>1 && $3=="running"'; \
+             pct list 2>/dev/null | awk 'NR>1 && $2=="running"') | wc -l
+          register: running_guests
+          changed_when: false
+          until: running_guests.stdout | trim | int == 0
+          retries: "{{ guest_drain_retries }}"
+          delay: "{{ guest_drain_delay }}"
+          when: wait_for_guests_to_leave | bool
+
+        - name: Reboot node
+          ansible.builtin.reboot:
+            reboot_timeout: 1200
+            msg: "Rebooting for Proxmox update (Ansible)"
+
+        - name: Wait for the node to rejoin the cluster with quorum
+          ansible.builtin.shell: pvecm status | grep -Eq 'Quorate:\s+Yes'
+          register: quorum_after_reboot
+          changed_when: false
+          until: quorum_after_reboot.rc == 0
+          retries: "{{ quorum_retries }}"
+          delay: "{{ quorum_delay }}"
+
+        - name: Take node out of HA maintenance mode
+          ansible.builtin.command: >-
+            ha-manager crm-command node-maintenance disable {{ pve_node_name }}
+          when: use_ha_maintenance | bool
+
+    - name: Verify core Proxmox services are active
+      ansible.builtin.command: systemctl is-active pve-cluster corosync pvedaemon pveproxy pvestatd
+      register: pve_services
+      changed_when: false
+      until: pve_services.rc == 0
+      retries: 6
+      delay: 10
+
+    - name: Final quorum check before moving to the next node
+      ansible.builtin.shell: pvecm status | grep -Eq 'Quorate:\s+Yes'
+      register: final_quorum
+      changed_when: false
+      until: final_quorum.rc == 0
+      retries: "{{ quorum_retries }}"
+      delay: "{{ quorum_delay }}"
