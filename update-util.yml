@@ -1,123 +1,40 @@
 ---
-# Serial dist-upgrade with a pre-flight check.
-#
-# Play 1 checks every inventory host: reachable over SSH, hostname matches its inventory name,
-#         and pve-cluster is running. Anything failing is reported and skipped.
-# Play 2 upgrades only the hosts that passed, one at a time.
-
-- name: Pre-flight check
-  hosts: proxmox
-  gather_facts: false
-  ignore_unreachable: true
-  vars:
-    ansible_python_interpreter: auto_silent
-    ansible_ssh_common_args: "-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
-    check_hostname: true      # set false if your inventory uses IPs instead of node names
-
-  tasks:
-    - name: "[{{ inventory_hostname }}] Reachable over SSH?"
-      ansible.builtin.ping:
-      register: ping_result
-
-    - name: "[{{ inventory_hostname }}] Ask the node for its own hostname"
-      ansible.builtin.command: hostname -s
-      register: remote_hostname
-      changed_when: false
-      failed_when: false
-      when: ping_result.ping | default('') == 'pong'
-
-    - name: "[{{ inventory_hostname }}] Is pve-cluster running?"
-      ansible.builtin.command: systemctl is-active pve-cluster
-      register: pve_active
-      changed_when: false
-      failed_when: false
-      when: ping_result.ping | default('') == 'pong'
-
-    - name: Sort hosts into ready / not_ready
-      ansible.builtin.group_by:
-        key: >-
-          {{ 'ready'
-             if (ping_result.ping | default('') == 'pong'
-                 and (pve_active.stdout | default('') | trim) == 'active'
-                 and (not check_hostname
-                      or (remote_hostname.stdout | default('') | trim) == inventory_hostname))
-             else 'not_ready' }}
-
-    - name: "[{{ inventory_hostname }}] Reason this host is skipped"
-      ansible.builtin.debug:
-        msg: >-
-          SKIPPING: {{
-            'not reachable (no SSH response)' if ping_result.ping | default('') != 'pong'
-            else 'pve-cluster is not active (not a working Proxmox node)' if (pve_active.stdout | default('') | trim) != 'active'
-            else 'it reports hostname "' ~ (remote_hostname.stdout | trim) ~ '" but the inventory calls it "' ~ inventory_hostname ~ '" (check ansible_host)'
-          }}
-      when: inventory_hostname in groups.get('not_ready', [])
-
-- name: Summary of pre-flight check
-  hosts: localhost
-  gather_facts: false
-  tasks:
-    - name: Ready and skipped hosts
-      ansible.builtin.debug:
-        msg:
-          - "READY   ({{ groups.get('ready', []) | length }}): {{ groups.get('ready', []) | join(', ') or 'none' }}"
-          - "SKIPPED ({{ groups.get('not_ready', []) | length }}): {{ groups.get('not_ready', []) | join(', ') or 'none' }}"
-
-    - name: Stop if nothing is ready
-      ansible.builtin.fail:
-        msg: No hosts passed the pre-flight check.
-      when: groups.get('ready', []) | length == 0
-
 - name: Rolling dist-upgrade of Proxmox nodes
-  hosts: ready
+  hosts: proxmox
   become: true
   serial: 1
-  any_errors_fatal: true
-  vars:
-    ansible_python_interpreter: auto_silent
-    ansible_ssh_common_args: "-o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=20"
+  ignore_unreachable: true      # a dead host is skipped instead of stalling the run
 
   tasks:
-    - name: "[{{ inventory_hostname }}] apt update"
+    - name: Is this host part of a cluster?
+      ansible.builtin.command: pvecm status
+      register: cluster_check
+      changed_when: false
+      failed_when: false
+
+    - name: Skip hosts that are not in a cluster
+      ansible.builtin.debug:
+        msg: "Skipping - not part of a Proxmox cluster"
+      when: cluster_check.rc != 0
+
+    - ansible.builtin.meta: end_host
+      when: cluster_check.rc != 0
+
+    - name: apt update
       ansible.builtin.apt:
         update_cache: true
-        lock_timeout: 120       # wait up to 2 min for another apt process instead of hanging/failing
 
-    - name: "[{{ inventory_hostname }}] List packages waiting to be upgraded"
-      ansible.builtin.shell: apt list --upgradable 2>/dev/null | tail -n +2
-      register: upgradable
-      changed_when: false
-
-    - name: "[{{ inventory_hostname }}] Pending upgrades"
-      ansible.builtin.debug:
-        msg: "{{ upgradable.stdout_lines | length }} package(s) to upgrade: {{ upgradable.stdout_lines | map('split', '/') | map('first') | join(', ') or 'none' }}"
-
-    - name: "[{{ inventory_hostname }}] apt dist-upgrade"
+    - name: apt dist-upgrade
       ansible.builtin.apt:
         upgrade: dist
         dpkg_options: force-confold,force-confdef
         lock_timeout: 120
-      register: upgrade_result
 
-    - name: "[{{ inventory_hostname }}] Upgrade result"
-      ansible.builtin.debug:
-        msg: >-
-          {{ 'UPGRADED' if upgrade_result.changed else 'already up to date' }}
-          ({{ upgradable.stdout_lines | length }} package(s) were pending)
-
-    - name: "[{{ inventory_hostname }}] Check services are still running"
-      ansible.builtin.command: systemctl is-active pve-cluster corosync pvedaemon pveproxy
-      register: svc
-      changed_when: false
-      retries: 6
-      delay: 10
-      until: svc.rc == 0
-
-    - name: "[{{ inventory_hostname }}] Installed Proxmox version"
+    - name: Proxmox version
       ansible.builtin.command: pveversion
       register: pvever
       changed_when: false
 
-    - name: "[{{ inventory_hostname }}] Done"
+    - name: Show version
       ansible.builtin.debug:
-        msg: "services: {{ svc.stdout_lines | join(', ') }} | {{ pvever.stdout }}"
+        msg: "{{ pvever.stdout }}"
