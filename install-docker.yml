@@ -1,57 +1,94 @@
-  - name: instal packages
-    apt:
-      state: present
-      install_recommends: false
-      pkg:
-        - bridge-utils
-        - ca-certificates
-        - curl
-        - gnupg
-      update_cache: true
+---
+# Installs Docker Engine + Compose plugin on Debian from Docker's official apt repository.
+# Put the target machine(s) in an inventory group called "docker", or change "hosts" below.
 
-  - name: get architecture
-    shell: dpkg --print-architecture
-    register: deb_architecture
+- name: Install Docker on Debian
+  hosts: docker
+  become: true
 
-  - name: get gpg key
-    get_url:
-      url: https://download.docker.com/linux/debian/gpg
-      dest: /etc/apt/keyrings/docker.asc
-      mode: 0644
-      force: true
-    tags: install_docker
+  vars:
+    docker_users: []            # users to add to the docker group, e.g. ["harry"]
+    docker_arch_map:
+      x86_64: amd64
+      aarch64: arm64
+      armv7l: armhf
 
-  - name: add docker apt repository key.
-    get_url:
-      url: https://download.docker.com/linux/debian/gpg
-      dest: /etc/apt/trusted.gpg.d/docker.asc
-      mode: 0644
-      force: true
-    tags: install_docker
+  tasks:
+    - name: Remove conflicting distro packages
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose
+          - docker-doc
+          - podman-docker
+          - containerd
+          - runc
+        state: absent
 
-  - name: add docker apt repository.
-    apt_repository:
-      repo: "deb [arch={{ deb_architecture.stdout }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
-      state: present
-      update_cache: yes
-      filename: docker
-    tags: install_docker
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+        update_cache: true
 
-  - name: install docker and related components
-    apt:
-      name:
-        - docker-ce
-        - docker-ce-cli
-        - containerd.io
-        - docker-buildx-plugin
-        - docker-compose-plugin
-      state: latest
-      update_cache: true
-    tags: install_docker
-    
-  - name: restart Docker 
-    systemd:
-      name: docker
-      state: restarted 
-      masked: no
-    tags: install_docker
+    - name: Create apt keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Docker's GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/debian/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Add Docker's apt repository
+      ansible.builtin.deb822_repository:
+        name: docker
+        types: deb
+        uris: https://download.docker.com/linux/debian
+        suites: "{{ ansible_facts['distribution_release'] }}"
+        components: stable
+        architectures: "{{ docker_arch_map[ansible_facts['architecture']] }}"
+        signed_by: /etc/apt/keyrings/docker.asc
+        state: present
+      register: docker_repo
+
+    - name: Install Docker Engine, CLI, containerd, buildx and compose
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: "{{ docker_repo.changed }}"
+
+    - name: Start Docker and enable it at boot
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add users to the docker group
+      ansible.builtin.user:
+        name: "{{ item }}"
+        groups: docker
+        append: true
+      loop: "{{ docker_users }}"
+
+    - name: Check Docker and Compose versions
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - docker --version
+        - docker compose version
+      register: versions
+      changed_when: false
+
+    - name: Show versions
+      ansible.builtin.debug:
+        msg: "{{ versions.results | map(attribute='stdout') | list }}"
