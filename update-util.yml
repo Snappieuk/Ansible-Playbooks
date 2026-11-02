@@ -24,6 +24,7 @@
     - name: apt update
       ansible.builtin.apt:
         update_cache: true
+        cache_valid_time: 3600      # skip if the package lists were refreshed in the last hour
 
     - name: apt dist-upgrade
       ansible.builtin.apt:
