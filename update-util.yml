@@ -3,6 +3,7 @@
   hosts: proxmox
   become: true
   serial: 1
+  gather_facts: false           # not needed, and avoids a slow failure on dead hosts
   ignore_unreachable: true      # a dead host is skipped instead of stalling the run
 
   tasks:
@@ -12,13 +13,13 @@
       changed_when: false
       failed_when: false
 
-    - name: Skip hosts that are not in a cluster
+    - name: Skip hosts that are unreachable or not in a cluster
       ansible.builtin.debug:
-        msg: "Skipping - not part of a Proxmox cluster"
-      when: cluster_check.rc != 0
+        msg: "Skipping - unreachable or not part of a Proxmox cluster"
+      when: cluster_check.rc | default(1) != 0
 
     - ansible.builtin.meta: end_host
-      when: cluster_check.rc != 0
+      when: cluster_check.rc | default(1) != 0
 
     - name: apt update
       ansible.builtin.apt:
