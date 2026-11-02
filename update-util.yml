@@ -30,6 +30,12 @@
         upgrade: dist
         dpkg_options: force-confold,force-confdef
         lock_timeout: 120
+      register: upgrade_result
+
+    - name: Packages upgraded
+      ansible.builtin.debug:
+        msg: "{{ upgrade_result.stdout_lines | select('match', '^Unpacking') | list }}"
+      when: upgrade_result.changed
 
     - name: Proxmox version
       ansible.builtin.command: pveversion
