@@ -2,8 +2,10 @@
 - name: Rolling dist-upgrade of Proxmox nodes
   hosts: proxmox
   become: true
-  serial: 1
+  serial: 5                     # nodes upgraded at the same time (set to 1 for strictly one-by-one)
   gather_facts: false           # not needed, and avoids a slow failure on dead hosts
+  vars:
+    ansible_ssh_pipelining: true   # fewer SSH round-trips per task
   ignore_unreachable: true      # a dead host is skipped instead of stalling the run
 
   tasks:
