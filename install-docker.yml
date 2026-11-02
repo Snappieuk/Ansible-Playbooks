@@ -25,6 +25,40 @@
           - runc
         state: absent
 
+    - name: Check for a classic sources.list
+      ansible.builtin.stat:
+        path: /etc/apt/sources.list
+      register: sources_list
+
+    - name: Disable the install-disc (cdrom) apt source
+      ansible.builtin.replace:
+        path: /etc/apt/sources.list
+        regexp: '^(deb\s+cdrom:.*)$'
+        replace: '# \1'
+      when: sources_list.stat.exists
+
+    - name: Make sure Debian's online repositories are configured
+      ansible.builtin.deb822_repository:
+        name: debian-online
+        types: deb
+        uris: http://deb.debian.org/debian
+        suites:
+          - "{{ ansible_facts['distribution_release'] }}"
+          - "{{ ansible_facts['distribution_release'] }}-updates"
+        components: main
+        signed_by: /usr/share/keyrings/debian-archive-keyring.gpg
+        state: present
+
+    - name: Make sure Debian's security repository is configured
+      ansible.builtin.deb822_repository:
+        name: debian-security-online
+        types: deb
+        uris: http://security.debian.org/debian-security
+        suites: "{{ ansible_facts['distribution_release'] }}-security"
+        components: main
+        signed_by: /usr/share/keyrings/debian-archive-keyring.gpg
+        state: present
+
     - name: Install prerequisites
       ansible.builtin.apt:
         name:
